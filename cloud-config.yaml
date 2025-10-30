@@ -5,10 +5,13 @@ timezone: Europe/Berlin
 package_update: true
 package_upgrade: true
 
+bootcmd:
+  - groupadd -f docker
+
 users:
   # Admin user with SSH key
   - name: oliver
-    groups: adm
+    groups: adm docker sudo
     shell: /bin/bash
     sudo: ALL=(ALL) ALL # allow sudo access
     lock_passwd: false # allow password authentication
@@ -36,7 +39,7 @@ write_files:
   - path: /etc/fail2ban/jail.local
     content: |
       [sshd]
-      maxretry = 3
+      maxretry = 5
       bantime = 1h
 
   # Unattended upgrades configuration
@@ -72,7 +75,6 @@ write_files:
         "iptables": true,
         "userland-proxy": false,
         "live-restore": true,
-        "userns-remap": "default",
         "log-driver": "json-file",
         "log-opts": {
           "max-size": "10m",
@@ -140,7 +142,6 @@ runcmd:
   # Install Docker
   - curl -fsSL https://get.docker.com | sh
   - systemctl enable --now docker
-  - usermod -aG docker oliver
 
   # Restart Docker daemon (to load daemon.json)
   - systemctl restart docker
