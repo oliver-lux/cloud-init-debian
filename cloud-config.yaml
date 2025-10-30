@@ -1,0 +1,148 @@
+#cloud-config
+
+timezone: Europe/Berlin
+
+package_update: true
+package_upgrade: true
+
+users:
+  # Admin user with SSH key
+  - name: oliver
+    groups: adm
+    shell: /bin/bash
+    sudo: ALL=(ALL) ALL # allow sudo access
+    lock_passwd: false # allow password authentication
+    hashed_passwd: "{{USER_PASSWORD_HASH}}"
+    ssh_authorized_keys:
+      - "{{SSH_PUBLIC_KEY}}"
+
+ssh_pwauth: false
+
+write_files:
+  # SSHD configuration
+  - path: /etc/ssh/sshd_config.d/90-final.conf
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin prohibit-password
+      PubkeyAuthentication yes
+      MaxAuthTries 3
+      AllowAgentForwarding no
+      AllowTcpForwarding no
+      X11Forwarding no
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+
+  # Fail2Ban configuration
+  - path: /etc/fail2ban/jail.local
+    content: |
+      [sshd]
+      maxretry = 3
+      bantime = 1h
+
+  # Unattended upgrades configuration
+  - path: /etc/apt/apt.conf.d/50unattended-upgrades
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+      Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+
+  # Kernel hardening
+  - path: /etc/sysctl.d/99-security.conf
+    content: |
+      # SYN flood protection
+      net.ipv4.tcp_syncookies = 1
+      net.ipv4.tcp_max_syn_backlog = 4096
+      # IP spoofing protection
+      net.ipv4.conf.all.rp_filter = 1
+      # Block ICMP redirects
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      # Disable source routing
+      net.ipv4.conf.all.accept_source_route = 0
+      # Hide kernel pointers
+      kernel.kptr_restrict = 2
+      kernel.dmesg_restrict = 1
+
+  # Docker security
+  - path: /etc/docker/daemon.json
+    content: |
+      {
+        "no-new-privileges": true,
+        "icc": false,
+        "iptables": true,
+        "userland-proxy": false,
+        "live-restore": true,
+        "userns-remap": "default",
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      }
+
+  # Bash configuration for user
+  - path: /home/oliver/.bash_profile
+    defer: true # run after user creation
+    content: |
+      # Customize prompt
+      PS1="\[\033]0;\u@\h\007\]\[\033[01;34m\]\w\n\[\033[01;32m\]# \[\033[00m\]"
+      # Aliases
+      alias ..="cd .."
+      alias l="ls -Alh --group-directories-first --color=auto"
+      alias ls="ls --color=auto"
+      alias ll="ls -lah"
+      alias grep="grep --color=auto"
+      alias df="df -h"
+      alias du1="du -h --max-depth=1"
+      alias du2="du -h --max-depth=2"
+      alias h="history"
+      alias c="clear"
+    owner: oliver:oliver
+    permissions: "0644"
+
+  # Suppress login messages
+  - path: /home/oliver/.hushlogin
+    defer: true # run after user creation
+    content: ""
+    owner: oliver:oliver
+    permissions: "0644"
+
+packages:
+  - fail2ban
+  - ufw
+  - curl
+  - zip
+  - unzip
+  - git
+  - htop
+  - unattended-upgrades
+  - apt-listchanges # Review package changes
+  - logwatch # Log monitoring
+
+runcmd:
+  # Configure UFW
+  - ufw --force reset
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw limit ssh comment 'SSH with rate limit'
+  - ufw allow http comment 'HTTP'
+  - ufw allow https comment 'HTTPS'
+  - ufw logging low
+  - ufw --force enable
+
+  # Configure and start Fail2Ban
+  - systemctl enable --now fail2ban
+  - systemctl restart ssh
+
+  # Apply sysctl settings
+  - sysctl --system
+
+  # Install Docker
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+  - usermod -aG docker oliver
+
+  # Restart Docker daemon (to load daemon.json)
+  - systemctl restart docker
+  - apt-get clean
+  - cloud-init status --wait # Wait for completion

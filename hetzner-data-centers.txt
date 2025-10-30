@@ -1,0 +1,18 @@
+# Hetzner data centers
+
+NBG:	Nuremberg - DE - 15ms
+FSN:	Falkenstein - DE - 17ms
+HEL:	Helsinki - FI - 34ms
+ASH:	Ashburn - USA - 96ms
+HIL:	Hillsboro - USA - 163ms
+
+# Ping multiple servers
+
+sudo apt install nmap
+
+nping -c 20 `
+	nbg.icmp.hetzner.com `
+	fsn.icmp.hetzner.com `
+	hel.icmp.hetzner.com `
+	ash.icmp.hetzner.com `
+	hil.icmp.hetzner.com
