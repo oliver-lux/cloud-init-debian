@@ -1,113 +1,35 @@
 #cloud-config
+# Hetzner Cloud host dedicated to dockerized web apps.
+# Model: one reverse proxy container owns 80/443, every other container
+# publishes to 127.0.0.1 only (or to no host port at all).
 
 timezone: Europe/Berlin
 
 package_update: true
 package_upgrade: true
 
-bootcmd:
-  - groupadd -f docker
+groups:
+  - docker
 
 users:
-  # Admin user with SSH key
   - name: oliver
-    groups: adm docker sudo
+    groups: [adm, docker, sudo]
     shell: /bin/bash
-    sudo: ALL=(ALL) ALL # allow sudo access
-    lock_passwd: false # allow password authentication
+    sudo: ALL=(ALL) ALL
+    lock_passwd: false # password is for console/sudo only, not for SSH
     hashed_passwd: "{{USER_PASSWORD_HASH}}"
     ssh_authorized_keys:
       - "{{SSH_PUBLIC_KEY}}"
 
 ssh_pwauth: false
 
-write_files:
-  # SSHD configuration
-  - path: /etc/ssh/sshd_config.d/90-final.conf
-    content: |
-      PasswordAuthentication no
-      PermitRootLogin prohibit-password
-      PubkeyAuthentication yes
-      MaxAuthTries 3
-      AllowAgentForwarding no
-      AllowTcpForwarding no
-      X11Forwarding no
-      ClientAliveInterval 300
-      ClientAliveCountMax 2
-
-  # Fail2Ban configuration
-  - path: /etc/fail2ban/jail.local
-    content: |
-      [sshd]
-      maxretry = 5
-      bantime = 1h
-
-  # Unattended upgrades configuration
-  - path: /etc/apt/apt.conf.d/50unattended-upgrades
-    content: |
-      Unattended-Upgrade::Automatic-Reboot "true";
-      Unattended-Upgrade::Automatic-Reboot-Time "03:00";
-      Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
-
-  # Kernel hardening
-  - path: /etc/sysctl.d/99-security.conf
-    content: |
-      # SYN flood protection
-      net.ipv4.tcp_syncookies = 1
-      net.ipv4.tcp_max_syn_backlog = 4096
-      # IP spoofing protection
-      net.ipv4.conf.all.rp_filter = 1
-      # Block ICMP redirects
-      net.ipv4.conf.all.accept_redirects = 0
-      net.ipv6.conf.all.accept_redirects = 0
-      # Disable source routing
-      net.ipv4.conf.all.accept_source_route = 0
-      # Hide kernel pointers
-      kernel.kptr_restrict = 2
-      kernel.dmesg_restrict = 1
-
-  # Docker security
-  - path: /etc/docker/daemon.json
-    content: |
-      {
-        "no-new-privileges": true,
-        "icc": false,
-        "iptables": true,
-        "userland-proxy": false,
-        "live-restore": true,
-        "log-driver": "json-file",
-        "log-opts": {
-          "max-size": "10m",
-          "max-file": "3"
-        }
-      }
-
-  # Bash configuration for user
-  - path: /home/oliver/.bash_profile
-    defer: true # run after user creation
-    content: |
-      # Customize prompt
-      PS1="\[\033]0;\u@\h\007\]\[\033[01;34m\]\w\n\[\033[01;32m\]# \[\033[00m\]"
-      # Aliases
-      alias ..="cd .."
-      alias l="ls -Alh --group-directories-first --color=auto"
-      alias ls="ls --color=auto"
-      alias ll="ls -lah"
-      alias grep="grep --color=auto"
-      alias df="df -h"
-      alias du1="du -h --max-depth=1"
-      alias du2="du -h --max-depth=2"
-      alias h="history"
-      alias c="clear"
-    owner: oliver:oliver
-    permissions: "0644"
-
-  # Suppress login messages
-  - path: /home/oliver/.hushlogin
-    defer: true # run after user creation
-    content: ""
-    owner: oliver:oliver
-    permissions: "0644"
+# Install Docker from the official apt repo instead of `curl | sh`.
+# This runs before runcmd and avoids racing the unattended-upgrades apt lock.
+apt:
+  sources:
+    docker:
+      source: "deb [signed-by=$KEY_FILE] https://download.docker.com/linux/ubuntu $RELEASE stable"
+      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 
 packages:
   - fail2ban
@@ -118,32 +40,255 @@ packages:
   - git
   - htop
   - unattended-upgrades
-  - apt-listchanges # Review package changes
-  - logwatch # Log monitoring
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+write_files:
+  # ---------------------------------------------------------------- SSH
+  - path: /etc/ssh/sshd_config.d/90-final.conf
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      AuthenticationMethods publickey
+      PubkeyAuthentication yes
+      PermitRootLogin no
+      AllowUsers oliver
+      MaxAuthTries 3
+      LoginGraceTime 30
+      AllowAgentForwarding no
+      # "local" keeps `ssh -L` working so you can reach admin UIs that are
+      # bound to 127.0.0.1 inside the host. "no" would lock you out of them.
+      AllowTcpForwarding local
+      GatewayPorts no
+      X11Forwarding no
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+
+  # ----------------------------------------------------------- Fail2Ban
+  - path: /etc/fail2ban/jail.local
+    content: |
+      [DEFAULT]
+      bantime  = 1h
+      findtime = 10m
+      maxretry = 4
+      # Ubuntu >= 22.04 has no /var/log/auth.log by default; without this
+      # the sshd jail fails to start.
+      backend  = systemd
+      banaction = ufw
+
+      [sshd]
+      enabled = true
+
+  # ------------------------------------------------- Unattended upgrades
+  # Separate drop-in: do NOT overwrite 50unattended-upgrades, that file
+  # carries the Allowed-Origins list. Replacing it disables all updates.
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    content: |
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      Unattended-Upgrade::Automatic-Reboot "true";
+      Unattended-Upgrade::Automatic-Reboot-Time "03:30";
+      Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+      // Docker packages are pinned deliberately; upgrade them yourself.
+      Unattended-Upgrade::Package-Blacklist {
+          "docker-ce";
+          "docker-ce-cli";
+          "containerd.io";
+      };
+
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+
+  # -------------------------------------------------- Kernel hardening
+  # NOTE: never set net.ipv4.ip_forward = 0 here, it breaks Docker networking.
+  - path: /etc/sysctl.d/99-security.conf
+    content: |
+      net.ipv4.tcp_syncookies = 1
+      net.ipv4.tcp_max_syn_backlog = 4096
+      # IP spoofing protection
+      net.ipv4.conf.all.rp_filter = 1
+      net.ipv4.conf.default.rp_filter = 1
+      # Block ICMP redirects
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.default.send_redirects = 0
+      net.ipv6.conf.all.accept_redirects = 0
+      net.ipv6.conf.default.accept_redirects = 0
+      # Disable source routing
+      net.ipv4.conf.all.accept_source_route = 0
+      net.ipv4.conf.default.accept_source_route = 0
+      net.ipv6.conf.all.accept_source_route = 0
+      net.ipv6.conf.default.accept_source_route = 0
+      net.ipv4.icmp_echo_ignore_broadcasts = 1
+      net.ipv4.icmp_ignore_bogus_error_responses = 1
+      net.ipv4.conf.all.log_martians = 1
+      # Hide kernel internals
+      kernel.kptr_restrict = 2
+      kernel.dmesg_restrict = 1
+      # More headroom for many containers
+      fs.inotify.max_user_instances = 1024
+      fs.inotify.max_user_watches = 524288
+      vm.swappiness = 10
+
+  # ------------------------------------------------------------ Docker
+  - path: /etc/docker/daemon.json
+    content: |
+      {
+        "no-new-privileges": true,
+        "userland-proxy": false,
+        "live-restore": true,
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        },
+        "default-address-pools": [
+          { "base": "172.20.0.0/14", "size": 24 }
+        ]
+      }
+
+  # UFW does not govern Docker-published ports: Docker's DNAT happens in
+  # PREROUTING, before UFW's filter rules. The DOCKER-USER chain is the
+  # only hook that does. Ports below are CONTAINER-internal ports.
+  - path: /usr/local/sbin/docker-ufw-guard
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      # Default-deny for traffic forwarded into containers from outside.
+      set -eu
+      for ipt in iptables ip6tables; do
+        $ipt -N DOCKER-USER 2>/dev/null || true
+        $ipt -F DOCKER-USER
+        $ipt -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+        # container-to-container traffic on docker bridges
+        $ipt -A DOCKER-USER -i docker0 -j RETURN
+        $ipt -A DOCKER-USER -i br-+ -j RETURN
+        # reverse proxy (container listens on 80/443 internally)
+        $ipt -A DOCKER-USER -p tcp --dport 80 -j RETURN
+        $ipt -A DOCKER-USER -p tcp --dport 443 -j RETURN
+        $ipt -A DOCKER-USER -j DROP
+      done
+
+  - path: /etc/systemd/system/docker-ufw-guard.service
+    content: |
+      [Unit]
+      Description=Default-deny rules in Docker's DOCKER-USER chain
+      After=docker.service
+      Requires=docker.service
+      PartOf=docker.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/docker-ufw-guard
+
+      [Install]
+      WantedBy=multi-user.target docker.service
+
+  # Nightly cleanup of dangling images/build cache so the disk does not fill.
+  - path: /etc/systemd/system/docker-prune.service
+    content: |
+      [Unit]
+      Description=Prune unused Docker data
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/docker system prune -af --filter "until=168h"
+      ExecStart=/usr/bin/docker volume prune -f
+
+  - path: /etc/systemd/system/docker-prune.timer
+    content: |
+      [Unit]
+      Description=Weekly Docker prune
+      [Timer]
+      OnCalendar=Sun 04:00
+      Persistent=true
+      [Install]
+      WantedBy=timers.target
+
+  # ---------------------------------------------------------- journald
+  - path: /etc/systemd/journald.conf.d/99-limits.conf
+    content: |
+      [Journal]
+      SystemMaxUse=500M
+      SystemMaxFileSize=50M
+      MaxRetentionSec=1month
+
+  # ------------------------------------------------------------- shell
+  - path: /home/oliver/.bash_profile
+    defer: true
+    owner: oliver:oliver
+    permissions: "0644"
+    content: |
+      PS1="\[\033]0;\u@\h\007\]\[\033[01;34m\]\w\n\[\033[01;32m\]# \[\033[00m\]"
+      alias ..="cd .."
+      alias l="ls -Alh --group-directories-first --color=auto"
+      alias ls="ls --color=auto"
+      alias ll="ls -lah"
+      alias grep="grep --color=auto"
+      alias df="df -h"
+      alias du1="du -h --max-depth=1"
+      alias du2="du -h --max-depth=2"
+      alias h="history"
+      alias c="clear"
+      alias dc="docker compose"
+      alias dps="docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
+      alias dlog="docker compose logs -f --tail=100"
+
+  - path: /home/oliver/.hushlogin
+    defer: true
+    owner: oliver:oliver
+    permissions: "0644"
+    content: ""
+
+# 2 GB swap: Hetzner cloud images ship without any, and an OOM kill during a
+# container build is a worse failure mode than a little paging.
+swap:
+  filename: /swapfile
+  size: 2147483648
+  maxsize: 2147483648
 
 runcmd:
-  # Configure UFW
+  # --- app directory ------------------------------------------------
+  - install -d -o oliver -g oliver -m 0750 /opt/stacks
+
+  # --- firewall -----------------------------------------------------
+  # These rules protect host services. Container-published ports are
+  # handled by docker-ufw-guard.service, not by UFW.
   - ufw --force reset
   - ufw default deny incoming
   - ufw default allow outgoing
-  - ufw limit ssh comment 'SSH with rate limit'
-  - ufw allow http comment 'HTTP'
-  - ufw allow https comment 'HTTPS'
+  - ufw limit 22/tcp comment 'SSH with rate limit'
+  - ufw allow 80/tcp comment 'HTTP'
+  - ufw allow 443/tcp comment 'HTTPS'
   - ufw logging low
   - ufw --force enable
 
-  # Configure and start Fail2Ban
+  # --- services -----------------------------------------------------
   - systemctl enable --now fail2ban
+  - systemctl enable --now docker
+  - systemctl daemon-reload
+  - systemctl enable --now docker-ufw-guard.service
+  - systemctl enable --now docker-prune.timer
+  - systemctl restart systemd-journald
+
+  # --- apply hardening ---------------------------------------------
+  - sysctl --system
   - systemctl restart ssh
 
-  # Apply sysctl settings
-  - sysctl --system
-
-  # Install Docker
-  - curl -fsSL https://get.docker.com | sh
-  - systemctl enable --now docker
-
-  # Restart Docker daemon (to load daemon.json)
-  - systemctl restart docker
+  # --- cleanup ------------------------------------------------------
+  - apt-get autoremove -y
   - apt-get clean
-  - cloud-init status --wait # Wait for completion
+
+# Reboot once so the freshly upgraded kernel and sysctl settings are live.
+power_state:
+  mode: reboot
+  condition: true
+  delay: now
+  message: "Rebooting after initial provisioning"
