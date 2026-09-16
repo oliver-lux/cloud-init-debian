@@ -1,4 +1,4 @@
-.private/*
+.secrets/*
 *.secret
 *.key
 *.pem
