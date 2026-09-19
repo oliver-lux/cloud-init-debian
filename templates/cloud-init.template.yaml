@@ -25,11 +25,21 @@ ssh_pwauth: false
 
 # Install Docker from the official apt repo instead of `curl | sh`.
 # This runs before runcmd and avoids racing the unattended-upgrades apt lock.
+#
+# We fetch and place the signing key ourselves (bootcmd, below) instead of
+# using cloud-init's `keyid` field: cloud-init writes that key file with
+# whatever the process umask happens to be, and under a strict root umask
+# (e.g. 027) it lands at mode 640 - unreadable by apt's sandboxed _apt/sqv
+# verifier, which makes the repo look unsigned and silently skips docker-ce.
 apt:
   sources:
     docker:
-      source: "deb [signed-by=$KEY_FILE] https://download.docker.com/linux/ubuntu $RELEASE stable"
-      keyid: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+      source: "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $RELEASE stable"
+
+bootcmd:
+  - install -d -m 0755 /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod 0644 /etc/apt/keyrings/docker.asc
 
 packages:
   - fail2ban
